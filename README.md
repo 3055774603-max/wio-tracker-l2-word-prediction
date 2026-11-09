@@ -1,5 +1,7 @@
 # Wio Tracker L2 — 英文联想输入固件
 
+[English](README_EN.md) | **简体中文**
+
 给 **Seeed Wio Tracker L2**（ESP32-S3、16 MB Flash、320×240 TFT）的 Meshtastic device-ui 虚拟键盘加英文单词预测：输入前缀，键盘上方出现 3 个候选词，点击即补全并追加空格。
 
 基于 Meshtastic firmware v2.8.3 + device-ui，词库 10000 词（按词频排序），编译与烧录均在 Windows 上完成并实测通过。
