@@ -1,0 +1,197 @@
+diff --git a/include/graphics/view/TFT/TFTView_320x240.h b/include/graphics/view/TFT/TFTView_320x240.h
+index 27df8ac..36cd65d 100644
+--- a/include/graphics/view/TFT/TFTView_320x240.h
++++ b/include/graphics/view/TFT/TFTView_320x240.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ #include "graphics/common/ChatHistory.h"
++#include "graphics/common/WordPredict.h"
+ 
+ #include "graphics/common/MeshtasticView.h"
+ #include "graphics/common/NodeStore.h"
+@@ -306,6 +307,12 @@ class TFTView_320x240 : public MeshtasticView, private NodeListActionSink
+     void hideKeyboard(lv_obj_t *panel);
+     // abort a running slide animation and restore panel/keyboard position at once
+     void resetKeyboardSlide(void);
++    // word prediction bar shown just above the virtual keyboard
++    void createPredictBar(void);
++    void updatePredictions(void);
++    void applyPrediction(uint8_t idx);
++    static void ui_event_PredictKey(lv_event_t *e);
++    static void ui_event_PredictBar(lv_event_t *e);
+     lv_obj_t *showQrCode(lv_obj_t *parent, const char *data);
+ 
+     void enablePanel(lv_obj_t *panel);
+@@ -581,6 +588,10 @@ class TFTView_320x240 : public MeshtasticView, private NodeListActionSink
+     std::array<lv_obj_t *, c_max_channels> ch_label;      // indexable label list for settings
+     meshtastic_Channel *channel_scratch;                  // temporary scratch copy of channel db
+     lv_obj_t *qr;                                         // qr code
++    lv_obj_t *predictBar = nullptr;                       // word prediction bar (child of the keyboard)
++    char predictCandidates[WordPredict::kMaxCandidates][WordPredict::kMaxWordLen];
++    const char *predictMap[WordPredict::kMaxCandidates + 1]; // btnmatrix map (must outlive set_map)
++    static constexpr int32_t kPredictBarHeight = 30;      // strip reserved above the keyboard
+     MapPanel *map = nullptr;                              // map
+     std::unordered_map<uint32_t, lv_obj_t *> nodeObjects; // nodeObjects displayed on map
+     // extended default device profile struct with additional required data
+diff --git a/source/graphics/TFT/TFTView_320x240.cpp b/source/graphics/TFT/TFTView_320x240.cpp
+index 6be5bba..115a340 100644
+--- a/source/graphics/TFT/TFTView_320x240.cpp
++++ b/source/graphics/TFT/TFTView_320x240.cpp
+@@ -7,6 +7,7 @@
+ #include "graphics/common/NodeListRowPresentation.h"
+ #include "graphics/common/Ringtones.h"
+ #include "graphics/common/ViewController.h"
++#include "graphics/common/WordPredict.h"
+ #include "graphics/driver/DisplayDriver.h"
+ #include "graphics/driver/DisplayDriverFactory.h"
+ #include "graphics/map/AsyncTileService.h"
+@@ -1061,6 +1062,7 @@ void TFTView_320x240::apply_hotfix(void)
+     }
+ 
+     lv_obj_move_foreground(objects.keyboard);
++    createPredictBar();
+ #if LV_USE_GESTURE_RECOGNITION
+     // let map gestures started on a node image reach ui_screen_event_cb on the main screen
+     lv_obj_add_flag(objects.map_panel, LV_OBJ_FLAG_EVENT_BUBBLE);
+@@ -8095,7 +8097,8 @@ void TFTView_320x240::showKeyboard(lv_obj_t *textArea)
+         lv_anim_init(&a1);
+         lv_anim_set_var(&a1, objects.messages_panel);
+         lv_anim_set_exec_cb(&a1, kbdSlideAnimCB);
+-        lv_anim_set_values(&a1, panelY, kbdPanelBaseY - kb_h);
++        // reserve the prediction bar strip above the keyboard so the input line stays visible
++        lv_anim_set_values(&a1, panelY, kbdPanelBaseY - kb_h - kPredictBarHeight);
+         lv_anim_set_duration(&a1, 300);
+         lv_anim_set_path_cb(&a1, lv_anim_path_linear);
+         lv_anim_start(&a1);
+@@ -8120,6 +8123,9 @@ void TFTView_320x240::showKeyboard(lv_obj_t *textArea)
+             // place below text area
+             lv_obj_set_pos(objects.keyboard, 0, text_coords.y2 + 3);
+         }
++        // word prediction is only enabled for the message input area
++        if (predictBar)
++            lv_obj_add_flag(predictBar, LV_OBJ_FLAG_HIDDEN);
+     }
+     lv_keyboard_set_textarea(objects.keyboard, textArea);
+     lv_group_focus_obj(objects.keyboard);
+@@ -8210,6 +8216,121 @@ void TFTView_320x240::resetKeyboardSlide(void)
+     kbdSlideState = eKbdHidden;
+ }
+ 
++// ======================= word prediction =======================
++
++static bool predictIsWordChar(uint8_t c)
++{
++    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
++}
++
++// start index of the letter run the cursor sits in
++static uint32_t predictWordStart(const char *text, uint32_t cursor)
++{
++    uint32_t start = cursor;
++    while (start > 0 && predictIsWordChar((uint8_t)text[start - 1]))
++        start--;
++    return start;
++}
++
++void TFTView_320x240::createPredictBar(void)
++{
++    if (predictBar)
++        return;
++
++    // the suggestion strip sits above the keyboard's top edge and must not be clipped by it
++    lv_obj_add_flag(objects.keyboard, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
++
++    predictBar = lv_buttonmatrix_create(objects.keyboard);
++    lv_obj_add_flag(predictBar, LV_OBJ_FLAG_HIDDEN);
++    lv_obj_set_size(predictBar, LV_PCT(100), kPredictBarHeight);
++    lv_obj_set_pos(predictBar, 0, -kPredictBarHeight);
++    lv_obj_set_style_pad_top(predictBar, 2, LV_PART_MAIN);
++    lv_obj_set_style_pad_bottom(predictBar, 2, LV_PART_MAIN);
++    lv_obj_add_event_cb(predictBar, ui_event_PredictBar, LV_EVENT_VALUE_CHANGED, this);
++    // refresh suggestions after the keyboard default handler has inserted/deleted text
++    lv_obj_add_event_cb(objects.keyboard, ui_event_PredictKey, LV_EVENT_VALUE_CHANGED, this);
++}
++
++void TFTView_320x240::updatePredictions(void)
++{
++    if (!predictBar)
++        return;
++
++    lv_obj_t *ta = lv_keyboard_get_textarea(objects.keyboard);
++    if (ta != objects.message_input_area) {
++        lv_obj_add_flag(predictBar, LV_OBJ_FLAG_HIDDEN);
++        return;
++    }
++
++    const char *text = lv_textarea_get_text(ta);
++    uint32_t len = strlen(text);
++    uint32_t cursor = lv_textarea_get_cursor_pos(ta);
++    if (cursor > len)
++        cursor = len;
++    uint32_t start = predictWordStart(text, cursor);
++    uint32_t prefixLen = cursor - start;
++
++    uint8_t count = 0;
++    if (prefixLen >= 2 && prefixLen < WordPredict::kMaxWordLen) {
++        char prefix[WordPredict::kMaxWordLen];
++        memcpy(prefix, text + start, prefixLen);
++        prefix[prefixLen] = '\0';
++        count = WordPredict::predict(prefix, predictCandidates, WordPredict::kMaxCandidates);
++    }
++
++    if (count) {
++        for (uint8_t i = 0; i < count; i++)
++            predictMap[i] = predictCandidates[i];
++        predictMap[count] = "";
++        lv_buttonmatrix_set_map(predictBar, predictMap);
++        lv_obj_remove_flag(predictBar, LV_OBJ_FLAG_HIDDEN);
++    } else {
++        lv_obj_add_flag(predictBar, LV_OBJ_FLAG_HIDDEN);
++    }
++}
++
++void TFTView_320x240::applyPrediction(uint8_t idx)
++{
++    if (!predictBar || idx >= WordPredict::kMaxCandidates || !predictCandidates[idx][0])
++        return;
++    lv_obj_t *ta = lv_keyboard_get_textarea(objects.keyboard);
++    if (!ta)
++        return;
++
++    const char *text = lv_textarea_get_text(ta);
++    uint32_t len = strlen(text);
++    uint32_t cursor = lv_textarea_get_cursor_pos(ta);
++    if (cursor > len)
++        cursor = len;
++    uint32_t start = predictWordStart(text, cursor);
++    if (cursor == start)
++        return;
++
++    // replace the typed prefix with the completed word plus a trailing space
++    lv_textarea_set_cursor_pos(ta, cursor);
++    for (uint32_t i = cursor; i > start; i--)
++        lv_textarea_del_char(ta);
++    lv_textarea_add_text(ta, predictCandidates[idx]);
++    lv_textarea_add_char(ta, ' ');
++
++    updatePredictions();
++    lv_group_focus_obj(objects.keyboard);
++}
++
++void TFTView_320x240::ui_event_PredictKey(lv_event_t *e)
++{
++    if (lv_event_get_code(e) == LV_EVENT_VALUE_CHANGED)
++        THIS->updatePredictions();
++}
++
++void TFTView_320x240::ui_event_PredictBar(lv_event_t *e)
++{
++    if (lv_event_get_code(e) == LV_EVENT_VALUE_CHANGED) {
++        uint32_t id = lv_buttonmatrix_get_selected_button(lv_event_get_target_obj(e));
++        THIS->applyPrediction((uint8_t)id);
++    }
++}
++
+ lv_obj_t *TFTView_320x240::showQrCode(lv_obj_t *parent, const char *data)
+ {
+     // Ensure all dynamically created widgets go to the panel content group

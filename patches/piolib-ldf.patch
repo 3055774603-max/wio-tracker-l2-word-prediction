@@ -1,0 +1,225 @@
+--- piolib.py
++++ piolib.py (L2 patch)
+@@ -120,6 +120,14 @@
+ 
+     _INCLUDE_DIRS_CACHE = None
+ 
++    # PATCH(l2): memoisation tables for the hot path of the dependency scan.
++    # is_common_builder() is evaluated once per (implicit include x library
++    # builder) pair and falls back to two os.path.realpath() calls per miss,
++    # which on Windows is the dominant cost of "Scanning dependencies...".
++    _IS_COMMON_BUILDER_CACHE = {}
++    _REALPATH_CACHE = {}
++    _ISFILE_CACHE = {}
++
+     def __init__(self, env, path, manifest=None, verbose=False):
+         self.env = env.Clone()
+         self.envorigin = env.Clone()
+@@ -141,6 +149,9 @@
+         self._deps_are_processed = False
+         self._circular_deps = []
+         self._processed_search_files = []
++        # PATCH(l2): O(1) membership mirror of the list above; the list is kept
++        # because it preserves the original ordering semantics elsewhere.
++        self._processed_search_files_set = set()
+ 
+         # pass a macro to the projenv + libs
+         if "test" in env["BUILD_TYPE"]:
+@@ -159,6 +170,42 @@
+         return self.is_common_builder(self.path, child_path)
+ 
+     def is_common_builder(self, root_path, child_path):
++        # PATCH(l2): the verdict depends only on the two path strings, and the
++        # same pairs are tested millions of times during the dependency scan.
++        cache = LibBuilderBase._IS_COMMON_BUILDER_CACHE
++        key = (root_path, child_path)
++        cached = cache.get(key)
++        if cached is not None:
++            return cached
++        cached = self._is_common_builder_uncached(root_path, child_path)
++        cache[key] = cached
++        return cached
++
++    @staticmethod
++    def _isfile_cached(path):
++        # PATCH(l2): the header->source probe stats the same handful of paths
++        # once per library scan. Nothing creates or deletes files while the
++        # dependency graph is being resolved, so the answer can be memoised.
++        cache = LibBuilderBase._ISFILE_CACHE
++        hit = cache.get(path)
++        if hit is None:
++            hit = os.path.isfile(path)
++            cache[path] = hit
++        return hit
++
++    @staticmethod
++    def _realpath_cached(path):
++        # PATCH(l2): os.path.realpath() on Windows resolves every path element
++        # through the filesystem; the same handful of roots is resolved over
++        # and over, so memoise it.
++        cache = LibBuilderBase._REALPATH_CACHE
++        resolved = cache.get(path)
++        if resolved is None:
++            resolved = os.path.realpath(path)
++            cache[path] = resolved
++        return resolved
++
++    def _is_common_builder_uncached(self, root_path, child_path):
+         if IS_WINDOWS:
+             root_path = root_path.lower()
+             child_path = child_path.lower()
+@@ -170,8 +217,8 @@
+         ):
+             return True
+         # try to resolve paths
+-        root_path = os.path.realpath(root_path)
+-        child_path = os.path.realpath(child_path)
++        root_path = LibBuilderBase._realpath_cached(root_path)
++        child_path = LibBuilderBase._realpath_cached(child_path)
+         return (
+             os.path.commonprefix([root_path + os.path.sep, child_path])
+             == root_path + os.path.sep
+@@ -373,12 +420,25 @@
+         include_dirs.extend(LibBuilderBase._INCLUDE_DIRS_CACHE)
+ 
+         result = []
+-        search_files = search_files or []
+-        while search_files:
+-            node = self.env.File(search_files.pop(0))
+-            if node.get_abspath() in self._processed_search_files:
++        # PATCH(l2): the original implementation used list.pop(0) for the work
++        # queue and `in` membership tests against both the queue and `result`.
++        # All three are O(n), which makes this loop quadratic in the number of
++        # implicit includes -- lvgl alone contributes thousands of them. Visit
++        # order is preserved; only the lookups become O(1).
++        result_paths = set()
++        search_files = list(search_files or [])
++        pending = set(search_files)
++        head = 0
++        while head < len(search_files):
++            queued = search_files[head]
++            head += 1
++            pending.discard(queued)
++            node = self.env.File(queued)
++            node_abspath = node.get_abspath()
++            if node_abspath in self._processed_search_files_set:
+                 continue
+-            self._processed_search_files.append(node.get_abspath())
++            self._processed_search_files.append(node_abspath)
++            self._processed_search_files_set.add(node_abspath)
+ 
+             try:
+                 assert "+" in self.lib_ldf_mode
+@@ -404,12 +464,16 @@
+                 item_path = item.get_abspath()
+                 # process internal files recursively
+                 if (
+-                    item_path not in self._processed_search_files
+-                    and item_path not in search_files
++                    item_path not in self._processed_search_files_set
++                    and item_path not in pending
+                     and item_path in self
+                 ):
+                     search_files.append(item_path)
+-                if item not in result:
++                    pending.add(item_path)
++                # PATCH(l2): dedupe on the absolute path rather than rescanning
++                # the whole `result` list with Node.__eq__ per candidate.
++                if item_path not in result_paths:
++                    result_paths.add(item_path)
+                     result.append(item)
+                 if not self.PARSE_SRC_BY_H_NAME:
+                     continue
+@@ -417,11 +481,13 @@
+                     continue
+                 item_fname = item_path[: item_path.rindex(".")]
+                 for ext in piobuild.SRC_C_EXT + piobuild.SRC_CXX_EXT:
+-                    if not os.path.isfile("%s.%s" % (item_fname, ext)):
++                    item_c_path = "%s.%s" % (item_fname, ext)
++                    if not LibBuilderBase._isfile_cached(item_c_path):
+                         continue
+-                    item_c_node = self.env.File("%s.%s" % (item_fname, ext))
+-                    if item_c_node not in result:
+-                        result.append(item_c_node)
++                    if item_c_path in result_paths:
++                        continue
++                    result_paths.add(item_c_path)
++                    result.append(self.env.File(item_c_path))
+ 
+         return result
+ 
+@@ -435,8 +501,31 @@
+         if self.lib_ldf_mode.startswith("deep"):
+             search_files = self.get_search_files()
+ 
++        # PATCH(l2): opt-in tracing. Set L2_LDF_TRACE=1 to see per-library
++        # timings; without it the "Scanning dependencies..." phase is silent
++        # and a hang is indistinguishable from slow progress.
++        import time as _time
++
++        _trace = os.environ.get("L2_LDF_TRACE")
++        _t0 = _time.time()
++        if _trace:
++            sys.stderr.write(
++                "[ldf] -> %s : %d seed file(s)\n" % (self.name, len(search_files or []))
++            )
++            sys.stderr.flush()
++
++        implicit_includes = self.get_implicit_includes(search_files)
++
++        if _trace:
++            _t1 = _time.time()
++            sys.stderr.write(
++                "[ldf]    %s : %d implicit include(s) in %.1fs\n"
++                % (self.name, len(implicit_includes), _t1 - _t0)
++            )
++            sys.stderr.flush()
++
+         lib_inc_map = {}
+-        for inc in self.get_implicit_includes(search_files):
++        for inc in implicit_includes:
+             inc_path = inc.get_abspath()
+             for lb in self.env.GetLibBuilders():
+                 if inc_path in lb:
+@@ -445,15 +534,39 @@
+                     lib_inc_map[lb].append(inc_path)
+                     break
+ 
++        if _trace:
++            sys.stderr.write(
++                "[ldf]    %s : mapped to %d lib(s) in %.1fs\n"
++                % (self.name, len(lib_inc_map), _time.time() - _t1)
++            )
++            sys.stderr.flush()
++
+         for lb, lb_search_files in lib_inc_map.items():
+             self.depend_on(lb, search_files=lb_search_files)
+ 
++        if _trace:
++            sys.stderr.write(
++                "[ldf] <- %s : total %.1fs\n" % (self.name, _time.time() - _t0)
++            )
++            sys.stderr.flush()
++
+     def depend_on(self, lb, search_files=None, recursive=True):
+-        def _already_depends(_lb):
++        def _already_depends(_lb, _seen=None):
++            # PATCH(l2): upstream has no memoization here. On a dense library
++            # DAG the number of distinct paths grows exponentially, so the
++            # "Scanning dependencies..." phase spins at 100% CPU with zero
++            # file I/O and never finishes. Reachability from a node is
++            # path-independent, so a shared visited-set keeps the semantics
++            # while making the traversal linear.
++            if _seen is None:
++                _seen = set()
++            if id(_lb) in _seen:
++                return False
++            _seen.add(id(_lb))
+             if self in _lb.depbuilders:
+                 return True
+             for __lb in _lb.depbuilders:
+-                if _already_depends(__lb):
++                if _already_depends(__lb, _seen):
+                     return True
+             return False
+ 

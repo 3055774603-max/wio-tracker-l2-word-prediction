@@ -1,0 +1,47 @@
+# PlatformIO / build output
+.pio/
+.pio-core/
+.pioenvs/
+.piolibdeps/
+build/
+dist/
+*.elf
+*.map
+*.o
+*.a
+*.bin.log
+
+# Python
+.venv/
+venv/
+penv/
+packenv/
+__pycache__/
+*.py[cod]
+
+# Local environment / machine-specific
+deps/
+delivery/
+maps/*.zip
+*.l2old*
+*.part
+*.piopm
+*.bak
+*.orig
+_lovyan_parts/
+_*.json
+_*.log
+_sandbox_test.txt
+
+# Logs and captures (may contain device identifiers and location)
+*.log
+serial_*.txt
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Keep release binaries tracked
+!releases/**/*.bin

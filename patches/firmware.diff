@@ -1,0 +1,52 @@
+diff --git a/platformio.ini b/platformio.ini
+index a9c6bd5..7ef72eb 100644
+--- a/platformio.ini
++++ b/platformio.ini
+@@ -23,6 +23,12 @@ build_flags =
+ 
+ [env]
+ test_build_src = true
++; Resolve the local device-ui fork from a dedicated sibling directory.
++; symlink:// cannot be used here because creating symlinks on Windows requires
++; administrator rights. The directory must contain ONLY device-ui: pointing this
++; at the mirror root would make PlatformIO recursively rescan every library under
++; firmware/.pio/libdeps as well, which costs ~20 minutes per build.
++lib_extra_dirs = ../libs
+ extra_scripts =
+ 	pre:bin/platformio-pre.py
+ 	pre:bin/optional-modules.py
+@@ -139,7 +145,16 @@ lib_deps =
+ [device-ui_base]
+ lib_deps =
+ 	# renovate: datasource=git-refs depName=meshtastic/device-ui packageName=https://github.com/meshtastic/device-ui gitBranch=master
+-	https://github.com/meshtastic/device-ui/archive/a5b80d4d5708d0563ea9e0c0277dc8984e2fb952.zip
++	; Local device-ui with word-prediction keyboard, resolved via lib_extra_dirs
++	; in [env] above. Upstream pin was a5b80d4d5708d0563ea9e0c0277dc8984e2fb952
++	meshtastic-device-ui
++	; A library picked up through lib_extra_dirs does NOT get its library.json
++	; "dependencies" installed automatically (unlike the upstream archive dep),
++	; so device-ui's own deps are listed explicitly here. ArduinoThread and
++	; Nanopb already come from the main [env] lib_deps.
++	https://github.com/lvgl/lvgl/archive/refs/tags/v9.3.0.zip
++	https://github.com/mverch67/libdeflate/archive/7291dd18ed11df673cce8e33b7f432a1273f1945.zip
++	https://github.com/mverch67/PNGdec/archive/d88b6fe2ec8d49c2b097a529b34d1d615ca5cf1b.zip
+ custom_sdkconfig =
+ 	# CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC is not set
+ 	CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+diff --git a/variants/esp32s3/seeed_wio_tracker_L2/platformio.ini b/variants/esp32s3/seeed_wio_tracker_L2/platformio.ini
+index 25c4cea..d1e4b7b 100644
+--- a/variants/esp32s3/seeed_wio_tracker_L2/platformio.ini
++++ b/variants/esp32s3/seeed_wio_tracker_L2/platformio.ini
+@@ -59,6 +59,12 @@ extends = env:seeed_wio_tracker_L2
+ board_level = release
+ 
+ build_flags = ${env:seeed_wio_tracker_L2.build_flags}
++  ; device-ui is pulled in through lib_extra_dirs, so PlatformIO's dependency
++  ; finder does not put LovyanGFX's headers on device-ui's include path even
++  ; though the variant already installs the library. Add it directly instead of
++  ; declaring it in device-ui/library.json: doing that drags LovyanGFX into the
++  ; recursive LDF closure and makes "Scanning dependencies" take 50+ minutes.
++  -I${platformio.libdeps_dir}/${this.__env__}/LovyanGFX/src
+   -D LV_LVGL_H_INCLUDE_SIMPLE
+   -D LV_CONF_INCLUDE_SIMPLE
+   -D LV_COMP_CONF_INCLUDE_SIMPLE
